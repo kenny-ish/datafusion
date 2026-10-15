@@ -79,6 +79,52 @@ fn spark_atan2(args: &[ArrayRef]) -> Result<ArrayRef> {
     let [y, x] = take_function_args("atan2", args)?;
     let y = y.as_primitive::<Float64Type>();
     let x = x.as_primitive::<Float64Type>();
-    let result: Float64Array = binary(y, x, |y, x| y.atan2(x))?;
+    // Spark adds 0.0 to both arguments before calling atan2, which turns a
+    // negative zero into a positive zero. Without this, atan2(-0.0, -1.0)
+    // returns -pi where Spark returns pi.
+    let result: Float64Array = binary(y, x, |y, x| (y + 0.0).atan2(x + 0.0))?;
     Ok(Arc::new(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f64::consts::PI;
+
+    fn atan2_scalar(y: f64, x: f64) -> f64 {
+        let result = spark_atan2(&[
+            Arc::new(Float64Array::from(vec![y])),
+            Arc::new(Float64Array::from(vec![x])),
+        ])
+        .unwrap();
+        result.as_primitive::<Float64Type>().value(0)
+    }
+
+    #[test]
+    fn test_atan2_negative_zero_is_normalized() {
+        // Spark normalizes -0.0 to 0.0 before calling atan2
+        assert_eq!(atan2_scalar(-0.0, -1.0), PI);
+        assert_eq!(atan2_scalar(0.0, -0.0).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(atan2_scalar(-0.0, -0.0).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(atan2_scalar(-0.0, 1.0).to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
+    fn test_atan2_nonzero_values_unchanged() {
+        assert_eq!(atan2_scalar(0.0, -1.0), PI);
+        assert_eq!(atan2_scalar(1.0, -1.0), 3.0 * PI / 4.0);
+        assert_eq!(atan2_scalar(-1.0, -1.0), -3.0 * PI / 4.0);
+        assert_eq!(atan2_scalar(1.0, 0.0), PI / 2.0);
+        assert_eq!(atan2_scalar(-1.0, 0.0), -PI / 2.0);
+    }
+
+    #[test]
+    fn test_atan2_null() {
+        let result = spark_atan2(&[
+            Arc::new(Float64Array::from(vec![None, Some(1.0)])),
+            Arc::new(Float64Array::from(vec![Some(1.0), None])),
+        ])
+        .unwrap();
+        assert_eq!(result.as_ref(), &Float64Array::from(vec![None, None]));
+    }
 }
